@@ -98,10 +98,21 @@ def run_cli(
     output: Path | None,
 ) -> int:
     try:
+        # Detect if root is a .md file instead of a directory
+        direct_files: list[Path] | None = None
+        actual_root = root
+        
+        if root.is_file() and root.suffix.lower() == ".md":
+            # If root is a .md file, use its parent as root and treat it as a direct file
+            direct_files = [root]
+            actual_root = root.parent
+            logging.getLogger(__name__).info("Treating %s as direct file with root %s", root, actual_root)
+        
         # Execute the aggregation workflow and surface any Python exception as a CLI error.
         aggregated = aggregate_markdown(
-            root=root,
+            root=actual_root,
             manifest=manifest,
+            direct_files=direct_files,
             ignore=ignore,
             separator=separator,
             strip_frontmatter_from_files=strip_frontmatter,

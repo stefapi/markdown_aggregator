@@ -171,12 +171,107 @@ def build_toc(entries: Sequence[Tuple[str, str]]) -> str:
     return buffer.getvalue()
 
 
+def increase_heading_level(content: str, levels: int = 1) -> str:
+    """
+    Increase the level of all Markdown headings by the specified number of levels.
+    Example: With levels=1, '# Title' becomes '## Title', '## Subtitle' becomes '### Subtitle', etc.
+    Headings at level 6 (######) will not be increased further as that's the maximum.
+    """
+    if levels <= 0:
+        return content
+    
+    def increase_heading(match: re.Match) -> str:
+        current_heading = match.group(0)
+        # Count the number of # at the start
+        hash_count = len(current_heading) - len(current_heading.lstrip('#'))
+        # Maximum heading level in Markdown is 6
+        new_hash_count = min(hash_count + levels, 6)
+        # Replace the heading with the new level
+        return '#' * new_hash_count + current_heading[hash_count:]
+    
+    # Match lines that start with one or more # (Markdown headings)
+    return re.sub(r'^#{1,6}\s+.+?$', increase_heading, content, flags=re.MULTILINE)
+
+
+def resolve_includes_in_content(
+    content: str,
+    current_file: Path,
+    root: Path,
+    seen: set[Path] | None = None,
+    strip_yaml: bool = False,
+    heading_level_increase: int = 1,
+) -> str:
+    """
+    Recursively replace <!-- @include: path.md --> directives with the actual content
+    of the referenced files. Handles nested includes and cycle detection.
+    
+    Parameters
+    ----------
+    content:
+        The Markdown content to process.
+    current_file:
+        The path to the file being processed.
+    root:
+        The root directory for resolving relative paths.
+    seen:
+        Set of already processed files for cycle detection.
+    strip_yaml:
+        Whether to strip YAML frontmatter from included files.
+    heading_level_increase:
+        Number of levels to increase headings in included content (default: 1).
+    """
+    if seen is None:
+        seen = set()
+    
+    seen.add(current_file)
+    
+    def replace_include(match: re.Match) -> str:
+        include_path = match.group(1)
+        resolved_path = resolve_include_path(include_path, current_file, root)
+        
+        if resolved_path is None:
+            logger.warning("Include target not found: %s (referenced from %s)", include_path, current_file)
+            return f"<!-- @include: {include_path} (NOT FOUND) -->"
+        
+        if resolved_path in seen:
+            logger.warning("Circular include detected: %s", resolved_path)
+            return f"<!-- @include: {include_path} (CIRCULAR REFERENCE) -->"
+        
+        # Read the included file content
+        included_content = read_text(resolved_path)
+        
+        # Strip frontmatter if requested
+        if strip_yaml:
+            included_content = strip_frontmatter(included_content)
+        
+        # Recursively resolve includes in the included content
+        included_content = resolve_includes_in_content(
+            included_content,
+            resolved_path,
+            root,
+            seen.copy(),  # Use a copy to allow the same file to be included in different branches
+            strip_yaml,
+            heading_level_increase,  # Propagate the heading level increase
+        )
+        
+        # Always increase heading levels by at least 1 for included content
+        # Plus any additional levels from the parent file's depth
+        total_increase = heading_level_increase + 1
+        included_content = increase_heading_level(included_content, total_increase)
+        
+        return included_content.strip()
+    
+    # Replace all @include directives in the content
+    return INCLUDE_RE.sub(replace_include, content)
+
+
 def aggregate(
     files: Sequence[Path],
     *,
     strip_yaml: bool,
     separator: str,
     root: Path,
+    process_includes_inline: bool = False,
 ) -> str:
     toc_entries: List[Tuple[str, str]] = []
     parts: List[str] = []
@@ -185,6 +280,23 @@ def aggregate(
         markdown = read_text(path)
         if strip_yaml:
             markdown = strip_frontmatter(markdown)
+
+        # Calculate directory depth relative to root for heading level adjustment
+        # Depth 0 = root level, Depth 1 = first subdirectory, etc.
+        relative_path = path.relative_to(root)
+        depth = len(relative_path.parts) - 1  # -1 because we don't count the file itself
+        
+        # Process @include directives inline if requested
+        if process_includes_inline:
+            # Pass the depth as the base heading level increase
+            # Includes will add +1 to this base level
+            markdown = resolve_includes_in_content(
+                markdown, 
+                path, 
+                root, 
+                strip_yaml=strip_yaml,
+                heading_level_increase=depth
+            )
 
         title = first_h1(markdown) or path.stem.replace("_", " ").replace("-", " ").title()
         anchor = slugify(title)
@@ -211,6 +323,7 @@ def aggregate_markdown(
     root: Path,
     *,
     manifest: Path | None = None,
+    direct_files: Iterable[Path] | None = None,
     ignore: Iterable[str] | None = None,
     separator: str = "---",
     strip_frontmatter_from_files: bool = False,
@@ -227,6 +340,8 @@ def aggregate_markdown(
         Root directory that contains Markdown files.
     manifest:
         Optional text file listing entries (files or directories) to process in order.
+    direct_files:
+        Optional iterable of Markdown file paths to process directly (treated as manifest entries).
     ignore:
         Iterable of glob patterns to skip during auto-discovery.
     separator:
@@ -252,29 +367,38 @@ def aggregate_markdown(
     manifest_files: List[Path] = []
     if manifest is not None:
         manifest_files = read_manifest(manifest.resolve(), root)
+    
+    # Add direct files to manifest_files with priority
+    if direct_files is not None:
+        direct_file_list = [f.resolve() for f in direct_files]
+        # Prepend direct files to manifest files (direct files have priority)
+        manifest_files = direct_file_list + manifest_files
 
     ignore_patterns = list(ignore or [])
     discovered_files: List[Path] = []
-    if manifest is None or hybrid_mode:
+    if (manifest is None and direct_files is None) or hybrid_mode:
         discovered_files = discover_files(root, ignore_patterns)
 
-    if hybrid_mode and manifest is not None:
+    if hybrid_mode and (manifest is not None or direct_files is not None):
         files = smart_merge_files(discovered_files, manifest_files)
         # Mirror CLI behaviour and emit information logs that can be surfaced to users.
         logger.info(
-            "Hybrid mode: %d files from manifest, %d discovered, %d total",
+            "Hybrid mode: %d files from manifest/direct, %d discovered, %d total",
             len(manifest_files),
             len(discovered_files),
             len(files),
         )
-    elif manifest is not None:
+    elif manifest is not None or direct_files is not None:
         files = manifest_files
     else:
         files = discovered_files
 
-    if process_includes_flag:
-        files = process_includes(list(files), root)
-        logger.info("Processed @include directives: %d files after processing", len(files))
+    # Note: When process_includes_flag is True, we now handle includes inline during aggregation
+    # rather than expanding the file list. The old process_includes function is kept for
+    # backward compatibility but is not used when inline processing is enabled.
+    # if process_includes_flag:
+    #     files = process_includes(list(files), root)
+    #     logger.info("Processed @include directives: %d files after processing", len(files))
 
     if not files:
         raise ValueError("No Markdown files found.")
@@ -285,6 +409,7 @@ def aggregate_markdown(
         strip_yaml=strip_frontmatter_from_files,
         separator="" if separator is None else separator,
         root=root,
+        process_includes_inline=process_includes_flag,
     )
 
     if output is not None:
