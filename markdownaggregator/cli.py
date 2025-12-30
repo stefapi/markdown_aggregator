@@ -69,6 +69,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Resolve <!-- @include: path.md --> directives recursively.",
     )
     parser.add_argument(
+        "--toc",
+        action="store_true",
+        help="Prepend a generated table of contents.",
+    )
+    parser.add_argument(
+        "--no-auto-file-title",
+        action="store_true",
+        help="Do not inject a top-level '# <File Name>' heading when a file has no H1.",
+    )
+    parser.add_argument(
         "--log-level",
         choices=LOG_LEVELS,
         default="WARNING",
@@ -95,6 +105,8 @@ def run_cli(
     strip_frontmatter: bool,
     hybrid_mode: bool,
     process_includes: bool,
+    include_toc: bool,
+    auto_file_title: bool,
     output: Path | None,
 ) -> int:
     try:
@@ -118,6 +130,8 @@ def run_cli(
             strip_frontmatter_from_files=strip_frontmatter,
             hybrid_mode=hybrid_mode,
             process_includes_flag=process_includes,
+            include_toc=include_toc,
+            auto_file_title=auto_file_title,
             output=output,
         )
     except Exception as exc:  # pragma: no cover - CLI safety
@@ -151,6 +165,8 @@ def main(argv: list[str] | None = None) -> int:
         strip_frontmatter=args.strip_frontmatter,
         hybrid_mode=args.hybrid_mode,
         process_includes=args.process_includes,
+        include_toc=args.toc,
+        auto_file_title=not args.no_auto_file_title,
         output=args.output,
     )
 

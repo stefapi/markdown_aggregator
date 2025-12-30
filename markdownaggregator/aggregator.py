@@ -35,8 +35,17 @@ def read_text(path: Path) -> str:
     return path.read_bytes().decode("utf-8", errors="replace")
 
 
-def first_h1(markdown: str) -> str | None:
-    match = HEADING_RE.search(markdown)
+def leading_h1(markdown: str) -> str | None:
+    """Return the first H1 title only if it appears at the very start of the document.
+
+    We intentionally *do not* scan the whole document because inline includes may
+    introduce headings later on; those should not be treated as the file title.
+    """
+
+    stripped = markdown.lstrip()
+    if not stripped.startswith("# "):
+        return None
+    match = HEADING_RE.match(stripped)
     return match.group(1).strip() if match else None
 
 
@@ -112,11 +121,6 @@ def smart_merge_files(discovered_files: List[Path], manifest_files: List[Path]) 
     return result
 
 
-def extract_includes(markdown: str) -> List[str]:
-    """Return every ``@include`` path declared via HTML comments in *markdown*."""
-    return [match.group(1) for match in INCLUDE_RE.finditer(markdown)]
-
-
 def resolve_include_path(include_path: str, current_file: Path, root: Path) -> Path | None:
     candidates = [
         current_file.parent / include_path,
@@ -132,36 +136,6 @@ def resolve_include_path(include_path: str, current_file: Path, root: Path) -> P
     return None
 
 
-def process_includes(files: List[Path], root: Path) -> List[Path]:
-    processed: List[Path] = []
-    seen: set[Path] = set()
-
-    def process_file(file_path: Path) -> None:
-        """Depth-first include expansion with cycle detection via *seen*."""
-        if file_path in seen:
-            return
-        seen.add(file_path)
-
-        if not file_path.exists():
-            logger.warning("Include target missing: %s", file_path)
-            return
-
-        content = read_text(file_path)
-        include_paths = extract_includes(content)
-
-        for include_path in include_paths:
-            resolved_path = resolve_include_path(include_path, file_path, root)
-            if resolved_path and resolved_path not in seen:
-                process_file(resolved_path)
-
-        processed.append(file_path)
-
-    for path in files:
-        process_file(path)
-
-    return processed
-
-
 def build_toc(entries: Sequence[Tuple[str, str]]) -> str:
     buffer = io.StringIO()
     buffer.write("# Table of contents\n\n")
@@ -171,26 +145,52 @@ def build_toc(entries: Sequence[Tuple[str, str]]) -> str:
     return buffer.getvalue()
 
 
-def increase_heading_level(content: str, levels: int = 1) -> str:
+HEADING_LINE_RE = re.compile(r"^#{1,6}\s+.+?$", re.MULTILINE)
+
+
+def shift_heading_levels(content: str, delta: int) -> str:
+    """Shift every Markdown heading level by *delta*.
+
+    - Positive delta increases heading depth (e.g. 1 => '#' -> '##').
+    - Negative delta decreases heading depth.
+
+    Heading levels are clamped to the Markdown range 1..6.
     """
-    Increase the level of all Markdown headings by the specified number of levels.
-    Example: With levels=1, '# Title' becomes '## Title', '## Subtitle' becomes '### Subtitle', etc.
-    Headings at level 6 (######) will not be increased further as that's the maximum.
-    """
-    if levels <= 0:
+
+    if delta == 0:
         return content
-    
-    def increase_heading(match: re.Match) -> str:
-        current_heading = match.group(0)
-        # Count the number of # at the start
-        hash_count = len(current_heading) - len(current_heading.lstrip('#'))
-        # Maximum heading level in Markdown is 6
-        new_hash_count = min(hash_count + levels, 6)
-        # Replace the heading with the new level
-        return '#' * new_hash_count + current_heading[hash_count:]
-    
-    # Match lines that start with one or more # (Markdown headings)
-    return re.sub(r'^#{1,6}\s+.+?$', increase_heading, content, flags=re.MULTILINE)
+
+    def shift(match: re.Match) -> str:
+        line = match.group(0)
+        hash_count = len(line) - len(line.lstrip("#"))
+        new_hash_count = min(max(hash_count + delta, 1), 6)
+        return "#" * new_hash_count + line[hash_count:]
+
+    return HEADING_LINE_RE.sub(shift, content)
+
+
+def min_heading_level(markdown: str) -> int | None:
+    """Return the minimal heading level (1..6) found in *markdown*, or None."""
+
+    levels: list[int] = []
+    for line in markdown.splitlines():
+        if not line.startswith("#"):
+            continue
+        # Fast path: only consider actual ATX headings.
+        if re.match(r"^#{1,6}\s+", line):
+            levels.append(len(line) - len(line.lstrip("#")))
+    return min(levels) if levels else None
+
+
+def last_heading_level_before(markdown: str, offset: int) -> int | None:
+    """Return the heading level of the last ATX heading before *offset*, or None."""
+
+    prefix = markdown[:offset]
+    matches = list(re.finditer(r"^#{1,6}\s+.+?$", prefix, flags=re.MULTILINE))
+    if not matches:
+        return None
+    last = matches[-1].group(0)
+    return len(last) - len(last.lstrip("#"))
 
 
 def resolve_includes_in_content(
@@ -199,7 +199,6 @@ def resolve_includes_in_content(
     root: Path,
     seen: set[Path] | None = None,
     strip_yaml: bool = False,
-    heading_level_increase: int = 1,
 ) -> str:
     """
     Recursively replace <!-- @include: path.md --> directives with the actual content
@@ -217,8 +216,6 @@ def resolve_includes_in_content(
         Set of already processed files for cycle detection.
     strip_yaml:
         Whether to strip YAML frontmatter from included files.
-    heading_level_increase:
-        Number of levels to increase headings in included content (default: 1).
     """
     if seen is None:
         seen = set()
@@ -228,22 +225,28 @@ def resolve_includes_in_content(
     def replace_include(match: re.Match) -> str:
         include_path = match.group(1)
         resolved_path = resolve_include_path(include_path, current_file, root)
-        
+
         if resolved_path is None:
             logger.warning("Include target not found: %s (referenced from %s)", include_path, current_file)
             return f"<!-- @include: {include_path} (NOT FOUND) -->"
-        
+
         if resolved_path in seen:
             logger.warning("Circular include detected: %s", resolved_path)
             return f"<!-- @include: {include_path} (CIRCULAR REFERENCE) -->"
-        
+
+        parent_level = last_heading_level_before(content, match.start())
+        # If we include at the top of a document (no heading found above), treat it as "level 0"
+        # so included content can start at H1.
+        if parent_level is None:
+            parent_level = 0
+
         # Read the included file content
         included_content = read_text(resolved_path)
-        
+
         # Strip frontmatter if requested
         if strip_yaml:
             included_content = strip_frontmatter(included_content)
-        
+
         # Recursively resolve includes in the included content
         included_content = resolve_includes_in_content(
             included_content,
@@ -251,14 +254,15 @@ def resolve_includes_in_content(
             root,
             seen.copy(),  # Use a copy to allow the same file to be included in different branches
             strip_yaml,
-            heading_level_increase,  # Propagate the heading level increase
         )
-        
-        # Always increase heading levels by at least 1 for included content
-        # Plus any additional levels from the parent file's depth
-        total_increase = heading_level_increase + 1
-        included_content = increase_heading_level(included_content, total_increase)
-        
+
+        # Rebase included headings so that the shallowest heading becomes (parent_level + 1).
+        included_min = min_heading_level(included_content)
+        if included_min is not None:
+            target_level = min(parent_level + 1, 6)
+            delta = target_level - included_min
+            included_content = shift_heading_levels(included_content, delta)
+
         return included_content.strip()
     
     # Replace all @include directives in the content
@@ -272,6 +276,8 @@ def aggregate(
     separator: str,
     root: Path,
     process_includes_inline: bool = False,
+    include_toc: bool = False,
+    auto_file_title: bool = True,
 ) -> str:
     toc_entries: List[Tuple[str, str]] = []
     parts: List[str] = []
@@ -281,42 +287,48 @@ def aggregate(
         if strip_yaml:
             markdown = strip_frontmatter(markdown)
 
-        # Calculate directory depth relative to root for heading level adjustment
-        # Depth 0 = root level, Depth 1 = first subdirectory, etc.
-        relative_path = path.relative_to(root)
-        depth = len(relative_path.parts) - 1  # -1 because we don't count the file itself
-        
         # Process @include directives inline if requested
         if process_includes_inline:
-            # Pass the depth as the base heading level increase
-            # Includes will add +1 to this base level
             markdown = resolve_includes_in_content(
-                markdown, 
-                path, 
-                root, 
+                markdown,
+                path,
+                root,
                 strip_yaml=strip_yaml,
-                heading_level_increase=depth
             )
 
-        title = first_h1(markdown) or path.stem.replace("_", " ").replace("-", " ").title()
-        anchor = slugify(title)
+        detected_h1 = leading_h1(markdown)
+        title: str | None
+        if detected_h1 is not None:
+            title = detected_h1
+        elif auto_file_title:
+            title = path.stem.replace("_", " ").replace("-", " ").title()
+        else:
+            title = None
 
-        header = f'<a id="{anchor}"></a>\n\n# {title}\n'
-        if markdown.lstrip().startswith("# "):
+        header = ""
+        if title is not None:
+            anchor = slugify(title)
+            header = f'<a id="{anchor}"></a>\n\n# {title}\n'
+
+        if detected_h1 is not None and markdown.lstrip().startswith("# "):
             markdown = HEADING_RE.sub("", markdown, count=1).lstrip()
 
         relative = path.relative_to(root)
         parts.append(f"<!-- Source: {relative} -->\n{header}\n{markdown.strip()}\n")
 
-        toc_entries.append((title, anchor))
+        if include_toc and title is not None:
+            toc_entries.append((title, slugify(title)))
         if separator:
             parts.append(f"\n{separator}\n")
 
     if parts and separator and parts[-1].strip() == separator.strip():
         parts.pop()
 
-    toc = build_toc(toc_entries)
-    return toc + "\n".join(parts).rstrip() + "\n"
+    body = "\n".join(parts).rstrip() + "\n"
+    if include_toc:
+        toc = build_toc(toc_entries)
+        return toc + body
+    return body
 
 
 def aggregate_markdown(
@@ -329,6 +341,8 @@ def aggregate_markdown(
     strip_frontmatter_from_files: bool = False,
     hybrid_mode: bool = False,
     process_includes_flag: bool = False,
+    include_toc: bool = False,
+    auto_file_title: bool = True,
     output: Path | None = None,
 ) -> str:
     """
@@ -393,12 +407,6 @@ def aggregate_markdown(
     else:
         files = discovered_files
 
-    # Note: When process_includes_flag is True, we now handle includes inline during aggregation
-    # rather than expanding the file list. The old process_includes function is kept for
-    # backward compatibility but is not used when inline processing is enabled.
-    # if process_includes_flag:
-    #     files = process_includes(list(files), root)
-    #     logger.info("Processed @include directives: %d files after processing", len(files))
 
     if not files:
         raise ValueError("No Markdown files found.")
@@ -410,6 +418,8 @@ def aggregate_markdown(
         separator="" if separator is None else separator,
         root=root,
         process_includes_inline=process_includes_flag,
+        include_toc=include_toc,
+        auto_file_title=auto_file_title,
     )
 
     if output is not None:

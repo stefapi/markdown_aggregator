@@ -6,11 +6,17 @@ This guide presents the main use cases of **markdownaggregator**.
 
 ```bash
 markdownaggregator docs/ --output dist/documentation.md
+
+# With TOC
+markdownaggregator docs/ --toc --output dist/documentation.md
+
+# Disable automatic titles when a file has no H1
+markdownaggregator docs/ --no-auto-file-title --output dist/documentation.md
 ```
 
 - Discovers every `*.md` file under `docs/`.
 - Produces a single `dist/documentation.md` document.
-- Automatically prepends a table of contents.
+- Prepends a table of contents when `--toc` is provided.
 - Inserts the separator `---` between files (configurable).
 
 ## Working with a manifest
@@ -75,6 +81,8 @@ merged = aggregate_markdown(
     strip_frontmatter_from_files=True,
     hybrid_mode=True,
     process_includes_flag=True,
+    include_toc=True,
+    auto_file_title=True,
     output=Path("dist/merged.md"),
 )
 ```

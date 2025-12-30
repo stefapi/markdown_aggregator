@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from markdownaggregator import aggregate_markdown
-from markdownaggregator import aggregator
+from markdownaggregator import aggregator as aggregator_module
 from markdownaggregator.cli import run_cli
 
 
@@ -18,7 +18,7 @@ def test_discover_files_respects_ignore(tmp_path: Path) -> None:
     (docs / "b.md").write_text("# B", encoding="utf-8")
     (docs / "README.txt").write_text("ignored", encoding="utf-8")
 
-    files = aggregator.discover_files(docs, ignore=["b.md"])
+    files = aggregator_module.discover_files(docs, ignore=["b.md"])
     assert [f.name for f in files] == ["a.md"]
 
 
@@ -41,7 +41,7 @@ def test_read_manifest_handles_directories(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    entries = aggregator.read_manifest(manifest, root)
+    entries = aggregator_module.read_manifest(manifest, root)
     assert entries == [
         docs / "intro.md",
         guide / "part1.md",
@@ -49,30 +49,104 @@ def test_read_manifest_handles_directories(tmp_path: Path) -> None:
     ]
 
 
-def test_process_includes_resolves_recursively(tmp_path: Path) -> None:
-    """Recursive include resolution should visit nested dependencies exactly once."""
+def test_inline_includes_rebase_heading_levels(tmp_path: Path) -> None:
+    """Included files should have their headings rebased to follow the parent heading."""
+
     root = tmp_path / "docs"
     root.mkdir()
-    (root / "main.md").write_text(
-        "# Main\n\n<!-- @include: section.md -->\n",
+
+    # Parent: include under an H2
+    (root / "parent.md").write_text(
+        "# chapitre 1\n"
+        "## sous chapitre 1.1\n"
+        "<!-- @include: fichierA.md -->\n",
         encoding="utf-8",
     )
-    (root / "section.md").write_text(
-        "# Section\n\n<!-- @include: appendix.md -->\n",
+
+    # Case 1: included file already starts at H2/H3 -> should become H3/H4
+    (root / "fichierA.md").write_text(
+        "## chapitre A\n"
+        "### chapitre A.1\n",
         encoding="utf-8",
     )
-    (root / "appendix.md").write_text("# Appendix", encoding="utf-8")
 
-    files = aggregator.process_includes([root / "main.md"], root)
-    assert files == [
-        root / "appendix.md",
-        root / "section.md",
-        root / "main.md",
-    ]
+    manifest = root / "manifest.txt"
+    manifest.write_text("parent.md\n", encoding="utf-8")
+
+    merged = aggregate_markdown(
+        root=root,
+        manifest=manifest,
+        process_includes_flag=True,
+    )
+
+    assert "## sous chapitre 1.1" in merged
+    assert "### chapitre A" in merged
+    assert "#### chapitre A.1" in merged
+
+    # Case 2: included file starts at H1/H2 -> should still become H3/H4
+    (root / "fichierA.md").write_text(
+        "# chapitre A\n"
+        "## chapitre A.1\n",
+        encoding="utf-8",
+    )
+
+    merged2 = aggregate_markdown(
+        root=root,
+        manifest=manifest,
+        process_includes_flag=True,
+    )
+
+    assert "### chapitre A" in merged2
+    assert "#### chapitre A.1" in merged2
 
 
-def test_aggregate_markdown_creates_toc_and_writes_output(tmp_path: Path) -> None:
-    """Aggregating files should yield a TOC and optionally persist to disk."""
+def test_inline_includes_at_top_level_start_at_h1(tmp_path: Path) -> None:
+    """If an include appears before any heading, included content should start at H1."""
+
+    root = tmp_path / "docs"
+    root.mkdir()
+
+    (root / "parent.md").write_text(
+        "<!-- @include: fichierA.md -->\n"
+        "# chapitre 1\n"
+        "<!-- @include: fichierB.md -->\n",
+        encoding="utf-8",
+    )
+
+    (root / "fichierA.md").write_text(
+        "## chapitre A\n"
+        "### chapitre A.1\n",
+        encoding="utf-8",
+    )
+
+    (root / "fichierB.md").write_text(
+        "### chapitre B\n"
+        "#### chapitre B.1\n",
+        encoding="utf-8",
+    )
+
+    manifest = root / "manifest.txt"
+    manifest.write_text("parent.md\n", encoding="utf-8")
+
+    merged = aggregate_markdown(
+        root=root,
+        manifest=manifest,
+        process_includes_flag=True,
+        auto_file_title=False,
+        separator="",
+    )
+
+    # First include: rebased to H1/H2
+    assert "# chapitre A" in merged
+    assert "## chapitre A.1" in merged
+
+    # Second include: after an H1, rebased to H2/H3
+    assert "## chapitre B" in merged
+    assert "### chapitre B.1" in merged
+
+
+def test_aggregate_markdown_default_has_no_toc_and_writes_output(tmp_path: Path) -> None:
+    """Aggregating files should *not* include a TOC by default and optionally persist to disk."""
     root = tmp_path / "docs"
     root.mkdir()
     (root / "intro.md").write_text("# Intro\n\nContent", encoding="utf-8")
@@ -85,12 +159,101 @@ def test_aggregate_markdown_creates_toc_and_writes_output(tmp_path: Path) -> Non
         output=output,
     )
 
-    assert "# Table of contents" in merged
+    assert "# Table of contents" not in merged
     assert '<a id="intro"></a>' in merged
     assert "<!-- Source: intro.md -->" in merged
     assert output.exists()
     written = output.read_text(encoding="utf-8")
     assert written == merged
+
+
+def test_aggregate_markdown_can_include_toc(tmp_path: Path) -> None:
+    """Aggregating files can prepend a TOC when include_toc=True."""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "intro.md").write_text("# Intro\n\nContent", encoding="utf-8")
+    (root / "chapter.md").write_text("# Chapter\n\nMore content", encoding="utf-8")
+
+    merged = aggregate_markdown(
+        root=root,
+        separator="---",
+        include_toc=True,
+    )
+
+    assert "# Table of contents" in merged
+
+
+def test_aggregate_markdown_can_disable_auto_file_title(tmp_path: Path) -> None:
+    """When auto_file_title is disabled, files without H1 should not get an injected title."""
+
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "no_title.md").write_text("Just some text\n\n## Sub\n", encoding="utf-8")
+
+    merged = aggregate_markdown(
+        root=root,
+        separator="",
+        auto_file_title=False,
+    )
+
+    assert "# No Title" not in merged
+    assert "## Sub" in merged
+
+
+def test_parent_free_text_does_not_get_header_from_included_h1(tmp_path: Path) -> None:
+    """Free text at the top of a parent file must not get a generated header from an include."""
+
+    root = tmp_path / "docs"
+    root.mkdir()
+
+    (root / "parent.md").write_text(
+        "Blah, Blah\n"
+        "Blah\n\n"
+        "<!-- @include: fichierA.md -->\n",
+        encoding="utf-8",
+    )
+
+    (root / "fichierA.md").write_text(
+        "## chapitre A\n"
+        "### chapitre A.1\n",
+        encoding="utf-8",
+    )
+
+    manifest = root / "manifest.txt"
+    manifest.write_text("parent.md\n", encoding="utf-8")
+
+    merged = aggregate_markdown(
+        root=root,
+        manifest=manifest,
+        process_includes_flag=True,
+        auto_file_title=False,
+        separator="",
+    )
+
+    # The free text remains at the top.
+    assert merged.lstrip().startswith("<!-- Source: parent.md -->\n\nBlah, Blah")
+    # Included content is present and rebased to H1.
+    assert "# chapitre A" in merged
+    assert "## chapitre A.1" in merged
+
+
+def test_aggregate_markdown_toc_skips_files_without_title(tmp_path: Path) -> None:
+    """TOC should not contain entries for files without a usable title when auto titles are disabled."""
+
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "no_title.md").write_text("Just some text\n\n## Sub\n", encoding="utf-8")
+
+    merged = aggregate_markdown(
+        root=root,
+        separator="",
+        include_toc=True,
+        auto_file_title=False,
+    )
+
+    assert "# Table of contents" in merged
+    # No TOC bullet for this file.
+    assert "- [No Title](#no-title)" not in merged
 
 
 def test_cli_run(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -107,6 +270,32 @@ def test_cli_run(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         strip_frontmatter=False,
         hybrid_mode=False,
         process_includes=False,
+        include_toc=False,
+        auto_file_title=True,
+        output=None,
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "# Table of contents" not in captured.out
+
+
+def test_cli_run_with_toc(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Smoke test: the CLI can output a TOC when requested."""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "index.md").write_text("# Index", encoding="utf-8")
+
+    exit_code = run_cli(
+        root=root,
+        manifest=None,
+        ignore=[],
+        separator="---",
+        strip_frontmatter=False,
+        hybrid_mode=False,
+        process_includes=False,
+        include_toc=True,
+        auto_file_title=True,
         output=None,
     )
     captured = capsys.readouterr()

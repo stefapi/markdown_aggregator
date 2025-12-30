@@ -57,6 +57,7 @@ pip install markdownaggregator
 markdownaggregator docs/ \
   --manifest manifest.txt \
   --process-includes \
+  --toc \
   --strip-frontmatter \
   --output dist/docs.md
 ```
@@ -81,6 +82,8 @@ merged = aggregate_markdown(
     strip_frontmatter_from_files=True,
     hybrid_mode=True,
     process_includes_flag=True,
+    include_toc=True,
+    auto_file_title=True,
     output=Path("dist/guide.md"),  # optional
 )
 
